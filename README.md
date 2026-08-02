@@ -64,7 +64,6 @@ Weeks run **Monday → Sunday** in every view.
 ```bash
 git clone https://github.com/pluton74mac/hermes-calendar-plugin.git
 cd hermes-calendar-plugin
-chmod +x install.sh
 ./install.sh
 ```
 
