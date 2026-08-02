@@ -11,23 +11,41 @@ A full-page calendar for the [Hermes desktop app](https://hermes-agent.nousresea
 
 | View | Description |
 |------|-------------|
-| **Year** | 12 mini month grids with event dot indicators; click a month to drill in |
+| **Year** | 12 mini month grids, 4 across; today and event days highlighted; click a month to drill in |
 | **Month** | Classic calendar grid with inline event previews (3 visible + "+N more") |
 | **Week** | 7-column card layout, color-coded by event type |
 | **Day** | Hourly timeline + all-day events bar + to-do checklist sidebar |
 
+Weeks run **Monday → Sunday** in every view.
+
 **Every view** supports:
 - ⬅ ➡ navigation arrows and a **Today** quick-jump button
 - Segmented control to switch views instantly
-- Click any event to edit (title, time, color, description)
-- Click empty space → Add Event dialog
+- Click any event to open its card; edit from there
+- Click a day to drill into it
 
 **To-Do Checklist** (Day view only):
 - Add / check off / delete items
 - Editable by both you and Hermes agents via the REST API
 - Persisted in SQLite across restarts
 
-**Statusbar Pill:** shows today's events + open todos at a glance; click to jump to `/calendar`.
+**Statusbar Pill:** shows today's events + open todos at a glance; click to open the calendar.
+
+### Opening the calendar
+
+| Surface | How |
+|---------|-----|
+| **Full-window overlay** | `⌘⌥C`, the statusbar pill, or ⌘K → *Calendar: Open*. Covers the session screen; **Esc** or ✕ closes it. |
+| **Separate OS window** | The ⧉ button in the calendar header, or ⌘K → *Calendar: Open in New Window*. |
+| **Pane tile** | The **Calendar** row in the sidebar routes to `/calendar` as a normal pane. |
+| **New event** | `⌘⌥E`, or ⌘K → *Calendar: New Event*. |
+
+> **On the separate window:** a plugin cannot open a calendar-*only* OS window —
+> Electron denies `window.open` (it hands the URL to the external browser), and the
+> route-targeted window kinds live in the main process. The ⧉ button uses the app's
+> own "new window" bridge and hands the new window a short-lived note through plugin
+> storage, so it raises the calendar as it boots. It is a full Hermes window that
+> opens showing the calendar.
 
 ---
 
@@ -97,9 +115,40 @@ plugins:
 
 | Shortcut | Action |
 |----------|--------|
+| `⌘⌥C` | Open the calendar |
+| **Today** button | Jump straight to today's day view |
 | `⌘⌥E` | New event |
-| Sidebar icon | Open calendar |
-| `⌘K` → `Calendar: Open` | Navigate to calendar |
+| Sidebar icon | Open calendar as a pane |
+| `⌘K` → `Calendar: Open` | Open the calendar |
+| `⌘K` → `Calendar: Open in New Window` | Pop out to a separate window |
+| `Esc` | Close the top layer (edit → card → settings → calendar) |
+
+### Picking a time
+
+Start and end each use an **hour** dropdown, a **minutes** dropdown in 5-minute
+steps, and an **AM/PM** toggle. Choosing `—` for the hour clears the time (an
+event may have no time without being all-day). A minute an agent wrote that
+isn't on the 5-minute grid stays selectable, so editing never silently moves
+it. An end at or before the start is flagged and blocks the save.
+
+### Event card
+
+Clicking an event opens a read-only card. Title, **when** (start – end) and
+**description** lead; provenance sits quietly below a rule — who created it
+(you, or the agent by name) with the date and time, and who last edited it and
+when. The ⚙ button opens the edit form.
+
+### Day view hours
+
+The day view fits its whole hour window on screen — no scrolling. The ⚙ chip
+above the timeline sets the window (default **6 AM – 10 PM**) and the choice is
+remembered. A day with an event outside the window widens **just for that day**
+to include it, and marks the borrowed hours.
+
+Events are drawn over the hour grid at their real position and size, so a
+two-hour meeting covers two hours. Overlapping events split the width into as
+many columns as they need — two, three, or more — and a column is reused once
+its previous event has ended. An event with no end time occupies one hour.
 
 ### Agent API
 
@@ -120,10 +169,15 @@ POST /api/plugins/calendar/events
   "end_time": "09:30",
   "all_day": false,
   "color": "#22c55e",
-  "description": "Daily sync"
+  "description": "Daily sync",
+
+  // Provenance — shown on the event card. Agents should identify
+  // themselves; omitting these records the event as user-created.
+  "creator": "agent",
+  "creator_name": "hermes-scheduler"
 }
 
-# Update an event
+# Update an event  (send an explicit null to clear a nullable field)
 PUT /api/plugins/calendar/events/{id}
 { "title": "Updated title" }
 
@@ -131,13 +185,20 @@ PUT /api/plugins/calendar/events/{id}
 DELETE /api/plugins/calendar/events/{id}
 ```
 
+`creator` is `"user"` or `"agent"` and is set **once, at creation** — a `PUT`
+cannot relabel who made an event. Pass `editor` / `editor_name` on a `PUT` to
+record who made *that* edit; the card shows it as "Last edited". A name is
+stored only alongside `"agent"`, so a `"user"` write can't carry an agent
+byline. Rows created before these fields existed report as `user`, which is the
+right assumption for a hand-made calendar.
+
 #### Todos
 
 ```bash
 # List todos for a date
 GET /api/plugins/calendar/todos?date=2026-08-05
 
-# Create a todo
+# Create a todo  (creator/creator_name accepted, same as events)
 POST /api/plugins/calendar/todos
 { "title": "Buy groceries", "date": "2026-08-05" }
 
@@ -167,11 +228,11 @@ Agents call these via `ctx.rest('/events?start_date=...')` inside their plugin c
 │  Hermes Desktop App (Electron)          │
 │  ┌──────────────────────────────────┐   │
 │  │  plugin.js                       │   │
-│  │  ├── ROUTES_AREA  → /calendar    │   │
+│  │  ├── ROUTES_AREA → /calendar     │   │
 │  │  ├── SIDEBAR_NAV → sidebar icon  │   │
-│  │  ├── STATUSBAR   → today pill    │   │
+│  │  ├── STATUSBAR   → pill+overlay  │   │
 │  │  ├── PALETTE     → ⌘K commands   │   │
-│  │  └── KEYBINDS    → ⌘⌥E           │   │
+│  │  └── KEYBINDS    → ⌘⌥C, ⌘⌥E      │   │
 │  └──────────────────┬───────────────┘   │
 │                     │ ctx.rest           │
 │                     ▼                    │
@@ -207,6 +268,25 @@ Agents call these via `ctx.rest('/events?start_date=...')` inside their plugin c
 ## Development
 
 The plugin is a single plain-JS ESM file — no build step, no bundler. Edit `plugin.js` and save; the desktop app hot-reloads it in place.
+
+### Styling: don't reach for Tailwind
+
+`plugin.js` ships its own stylesheet (`PLUGIN_CSS`, injected into `<head>` at
+register and removed on unload) and styles its markup with `hcal-*` classes.
+
+**Do not add Tailwind utility classes to this plugin's own markup.** Tailwind v4
+generates utilities by scanning the *app's* source at build time. A plugin loaded
+at runtime from `~/.hermes/desktop-plugins` is not in that scan, so any class the
+app doesn't already use for itself has no rule at all and silently does nothing.
+`grid-cols-7` is the one that mattered: absent from the shipped stylesheet, it
+collapsed every calendar grid into a single column.
+
+Components imported from `@hermes/plugin-sdk` (`Button`, `Input`, `Dialog`, …) are
+app-built and bring their own styling — keep using those.
+
+Theme colors are read as CSS custom properties (`--ui-text-primary`, `--ui-accent`,
+`--ui-surface-background`, …). Those are runtime values, not build-time utilities,
+so they are always available and the calendar re-themes with the rest of Hermes.
 
 ```bash
 # After editing, typing in save triggers hot reload

@@ -6,15 +6,14 @@ Stores events and todos in an SQLite database at ~/.hermes/calendar.db.
 
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
 import time
-from datetime import date, datetime, timedelta
+from datetime import date
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
@@ -50,6 +49,10 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             all_day     INTEGER NOT NULL DEFAULT 0,
             color       TEXT DEFAULT '#4f8cff',
             description TEXT DEFAULT '',
+            creator     TEXT NOT NULL DEFAULT 'user',
+            creator_name TEXT,
+            editor      TEXT,
+            editor_name TEXT,
             created_at  REAL NOT NULL,
             updated_at  REAL NOT NULL
         );
@@ -59,12 +62,40 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             date        TEXT NOT NULL,
             completed   INTEGER NOT NULL DEFAULT 0,
             "order"     REAL NOT NULL DEFAULT 0,
+            creator     TEXT NOT NULL DEFAULT 'user',
+            creator_name TEXT,
             created_at  REAL NOT NULL,
             updated_at  REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_events_date ON events(date);
         CREATE INDEX IF NOT EXISTS idx_todos_date ON todos(date);
     """)
+    _migrate(conn)
+
+
+# Columns added after 1.0.0. Existing databases predate them, and CREATE TABLE
+# IF NOT EXISTS won't touch a table that already exists — so add them here.
+_ADDED_COLUMNS = {
+    "events": {
+        "creator": "TEXT NOT NULL DEFAULT 'user'",
+        "creator_name": "TEXT",
+        "editor": "TEXT",
+        "editor_name": "TEXT",
+    },
+    "todos": {
+        "creator": "TEXT NOT NULL DEFAULT 'user'",
+        "creator_name": "TEXT",
+    },
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for table, columns in _ADDED_COLUMNS.items():
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in columns.items():
+            if name not in existing:
+                conn.execute(f'ALTER TABLE {table} ADD COLUMN "{name}" {decl}')
+    conn.commit()
 
 
 def _now() -> float:
@@ -92,6 +123,10 @@ class EventCreate(BaseModel):
     all_day: bool = False
     color: str = "#4f8cff"
     description: str = ""
+    # Provenance, shown on the event card. Agents should POST
+    # creator="agent" plus their own name; the UI sends "user".
+    creator: str = Field("user", pattern=r"^(user|agent)$")
+    creator_name: Optional[str] = Field(None, max_length=120)
 
 
 class EventUpdate(BaseModel):
@@ -102,11 +137,16 @@ class EventUpdate(BaseModel):
     all_day: Optional[bool] = None
     color: Optional[str] = None
     description: Optional[str] = None
+    # Who is making THIS edit — recorded as the event's last editor.
+    editor: Optional[str] = Field(None, pattern=r"^(user|agent)$")
+    editor_name: Optional[str] = Field(None, max_length=120)
 
 
 class TodoCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=500)
     date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    creator: str = Field("user", pattern=r"^(user|agent)$")
+    creator_name: Optional[str] = Field(None, max_length=120)
 
 
 class TodoUpdate(BaseModel):
@@ -144,11 +184,16 @@ def create_event(body: EventCreate):
     try:
         ev_id = _make_id()
         ts = _now()
+        # A name only means something for an agent; never let a "user" event
+        # carry an agent byline.
+        name = body.creator_name if body.creator == "agent" else None
         conn.execute(
-            "INSERT INTO events (id, title, date, start_time, end_time, all_day, color, description, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO events (id, title, date, start_time, end_time, all_day, color, description, "
+            "creator, creator_name, editor, editor_name, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (ev_id, body.title, body.date, body.start_time, body.end_time,
-             int(body.all_day), body.color, body.description, ts, ts),
+             int(body.all_day), body.color, body.description,
+             body.creator, name, body.creator, name, ts, ts),
         )
         conn.commit()
         row = conn.execute("SELECT * FROM events WHERE id = ?", (ev_id,)).fetchone()
@@ -166,14 +211,19 @@ def update_event(event_id: str, body: EventUpdate):
         if not existing:
             raise HTTPException(status_code=404, detail="Event not found")
 
-        updates = {}
-        if body.title is not None:
+        # Only touch fields the client actually sent, so a partial update can
+        # leave the rest alone. Nullable columns use presence (not None-ness)
+        # so an explicit `null` clears them — that is how the UI drops the
+        # times off an event when it is switched to all-day.
+        sent = body.model_fields_set
+        updates: dict[str, Any] = {}
+        if body.title is not None:  # NOT NULL column — null means "leave it"
             updates["title"] = body.title
         if body.date is not None:
             updates["date"] = body.date
-        if body.start_time is not None:
+        if "start_time" in sent:
             updates["start_time"] = body.start_time
-        if body.end_time is not None:
+        if "end_time" in sent:
             updates["end_time"] = body.end_time
         if body.all_day is not None:
             updates["all_day"] = int(body.all_day)
@@ -181,10 +231,13 @@ def update_event(event_id: str, body: EventUpdate):
             updates["color"] = body.color
         if body.description is not None:
             updates["description"] = body.description
+        if body.editor is not None:
+            updates["editor"] = body.editor
+            updates["editor_name"] = body.editor_name if body.editor == "agent" else None
 
         updates["updated_at"] = _now()
 
-        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        set_clause = ", ".join(f'"{k}" = ?' for k in updates)
         values = list(updates.values()) + [event_id]
         conn.execute(f"UPDATE events SET {set_clause} WHERE id = ?", values)
         conn.commit()
@@ -242,9 +295,10 @@ def create_todo(body: TodoCreate):
             (body.date,),
         ).fetchone()[0]
         conn.execute(
-            "INSERT INTO todos (id, title, date, completed, \"order\", created_at, updated_at) "
-            "VALUES (?, ?, ?, 0, ?, ?, ?)",
-            (todo_id, body.title, body.date, max_order, ts, ts),
+            "INSERT INTO todos (id, title, date, completed, \"order\", creator, creator_name, created_at, updated_at) "
+            "VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)",
+            (todo_id, body.title, body.date, max_order,
+             body.creator, body.creator_name if body.creator == "agent" else None, ts, ts),
         )
         conn.commit()
         row = conn.execute("SELECT * FROM todos WHERE id = ?", (todo_id,)).fetchone()
@@ -262,7 +316,7 @@ def update_todo(todo_id: str, body: TodoUpdate):
         if not existing:
             raise HTTPException(status_code=404, detail="Todo not found")
 
-        updates = {}
+        updates: dict[str, Any] = {}
         if body.title is not None:
             updates["title"] = body.title
         if body.completed is not None:
@@ -274,7 +328,9 @@ def update_todo(todo_id: str, body: TodoUpdate):
 
         updates["updated_at"] = _now()
 
-        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        # Identifiers are quoted: "order" is an SQL reserved word, so an
+        # unquoted `SET order = ?` is a syntax error.
+        set_clause = ", ".join(f'"{k}" = ?' for k in updates)
         values = list(updates.values()) + [todo_id]
         conn.execute(f"UPDATE todos SET {set_clause} WHERE id = ?", values)
         conn.commit()
