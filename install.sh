@@ -19,7 +19,15 @@ cp dashboard/manifest.json "$BACKEND_DIR/manifest.json"
 cp dashboard/plugin_api.py "$BACKEND_DIR/plugin_api.py"
 echo "  ✓ Backend API → $BACKEND_DIR/plugin_api.py"
 
-# 3. Enable in config
+# 3. Agent skill (discovery + the CLI agents drive the backend with)
+SKILL_DIR="$HERMES_HOME/skills/productivity/hermes-calendar"
+mkdir -p "$SKILL_DIR/scripts"
+cp skill/SKILL.md "$SKILL_DIR/SKILL.md"
+cp skill/scripts/calendar.py "$SKILL_DIR/scripts/calendar.py"
+chmod +x "$SKILL_DIR/scripts/calendar.py"
+echo "  ✓ Agent skill → $SKILL_DIR/SKILL.md"
+
+# 4. Enable in config
 if command -v hermes &>/dev/null; then
   if hermes plugins list 2>/dev/null | grep -q "$PLUGIN_NAME"; then
     echo "  ✓ Plugin already enabled"
@@ -37,3 +45,4 @@ echo "   Reload desktop plugins (⌘K → Reload desktop plugins)"
 echo "   or restart Hermes for the backend API to take effect."
 echo ""
 echo "   Then navigate to /calendar via sidebar or ⌘K → Calendar: Open"
+echo "   Agents pick up the calendar skill on their next session."

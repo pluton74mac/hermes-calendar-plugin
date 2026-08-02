@@ -7,7 +7,9 @@ Stores events and todos in an SQLite database at ~/.hermes/calendar.db.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
+import sys
 import time
 from datetime import date
 from pathlib import Path
@@ -20,7 +22,27 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
-DB_PATH = Path.home() / ".hermes" / "calendar.db"
+def _default_hermes_home() -> Path:
+    """Platform-native Hermes home, matching hermes_constants."""
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+        return base / "hermes"
+    return Path.home() / ".hermes"
+
+
+def _hermes_home() -> Path:
+    """Honour HERMES_HOME so a profile-scoped install reads its own database.
+
+    Resolved through the environment rather than ``hermes_constants`` on
+    purpose: this module is imported directly (no HTTP) by the agent CLI in
+    skills/, which may run outside the Hermes package path.
+    """
+    configured = os.environ.get("HERMES_HOME", "").strip()
+    return Path(configured) if configured else _default_hermes_home()
+
+
+DB_PATH = _hermes_home() / "calendar.db"
 
 
 # ---------------------------------------------------------------------------
@@ -115,37 +137,46 @@ def _make_id() -> str:
 # Pydantic models
 # ---------------------------------------------------------------------------
 
+# `\d{2}` would happily accept "25:00" or "09:99", and `\d{2}-\d{2}` a 13th
+# month — bounded alternatives keep nonsense out of the database. Day-of-month
+# is range-checked, not calendar-checked (Feb 30 still parses); the UI only
+# ever sends real dates and a bad one simply lands on a day nobody visits.
+_DATE_RE = r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$"
+_TIME_RE = r"^([01]\d|2[0-3]):[0-5]\d$"
+_ACTOR_RE = r"^(user|agent)$"
+
+
 class EventCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=500)
-    date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
-    start_time: Optional[str] = Field(None, pattern=r"^\d{2}:\d{2}$")
-    end_time: Optional[str] = Field(None, pattern=r"^\d{2}:\d{2}$")
+    date: str = Field(..., pattern=_DATE_RE)
+    start_time: Optional[str] = Field(None, pattern=_TIME_RE)
+    end_time: Optional[str] = Field(None, pattern=_TIME_RE)
     all_day: bool = False
     color: str = "#4f8cff"
     description: str = ""
     # Provenance, shown on the event card. Agents should POST
     # creator="agent" plus their own name; the UI sends "user".
-    creator: str = Field("user", pattern=r"^(user|agent)$")
+    creator: str = Field("user", pattern=_ACTOR_RE)
     creator_name: Optional[str] = Field(None, max_length=120)
 
 
 class EventUpdate(BaseModel):
     title: Optional[str] = Field(None, min_length=1, max_length=500)
-    date: Optional[str] = Field(None, pattern=r"^\d{4}-\d{2}-\d{2}$")
-    start_time: Optional[str] = Field(None, pattern=r"^\d{2}:\d{2}$")
-    end_time: Optional[str] = Field(None, pattern=r"^\d{2}:\d{2}$")
+    date: Optional[str] = Field(None, pattern=_DATE_RE)
+    start_time: Optional[str] = Field(None, pattern=_TIME_RE)
+    end_time: Optional[str] = Field(None, pattern=_TIME_RE)
     all_day: Optional[bool] = None
     color: Optional[str] = None
     description: Optional[str] = None
     # Who is making THIS edit — recorded as the event's last editor.
-    editor: Optional[str] = Field(None, pattern=r"^(user|agent)$")
+    editor: Optional[str] = Field(None, pattern=_ACTOR_RE)
     editor_name: Optional[str] = Field(None, max_length=120)
 
 
 class TodoCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=500)
-    date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
-    creator: str = Field("user", pattern=r"^(user|agent)$")
+    date: str = Field(..., pattern=_DATE_RE)
+    creator: str = Field("user", pattern=_ACTOR_RE)
     creator_name: Optional[str] = Field(None, max_length=120)
 
 
@@ -153,7 +184,7 @@ class TodoUpdate(BaseModel):
     title: Optional[str] = Field(None, min_length=1, max_length=500)
     completed: Optional[bool] = None
     order: Optional[float] = None
-    date: Optional[str] = Field(None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    date: Optional[str] = Field(None, pattern=_DATE_RE)
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +193,8 @@ class TodoUpdate(BaseModel):
 
 @router.get("/events")
 def list_events(
-    start_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    end_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    start_date: str = Query(..., pattern=_DATE_RE),
+    end_date: str = Query(..., pattern=_DATE_RE),
 ):
     """Get events in a date range."""
     conn = _get_conn()
@@ -268,7 +299,7 @@ def delete_event(event_id: str):
 
 @router.get("/todos")
 def list_todos(
-    date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    date: str = Query(..., pattern=_DATE_RE),
 ):
     """Get todos for a specific date."""
     conn = _get_conn()

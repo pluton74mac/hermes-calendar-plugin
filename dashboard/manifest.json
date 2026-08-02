@@ -3,7 +3,7 @@
   "label": "Calendar Backend",
   "description": "Calendar events and todos API backend — desktop plugin only (UI loads via desktop-plugins/calendar/plugin.js, not this manifest's entry)",
   "icon": "Calendar",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "tab": {
     "hidden": true
   },

@@ -1,5 +1,5 @@
 /**
- * Calendar — Hermes desktop plugin. v1.1.0
+ * Calendar — Hermes desktop plugin. v1.2.0
  *
  * A full-page calendar with year/month/week/day views, event CRUD and
  * to-do checklists. Agents read/write events and todos via the REST

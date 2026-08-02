@@ -26,7 +26,7 @@ Weeks run **Monday → Sunday** in every view.
 
 **To-Do Checklist** (Day view only):
 - Add / check off / delete items
-- Editable by both you and Hermes agents via the REST API
+- Editable by both you and Hermes agents (see [Agent API](#agent-api))
 - Persisted in SQLite across restarts
 
 **Statusbar Pill:** shows today's events + open todos at a glance; click to open the calendar.
@@ -83,7 +83,15 @@ cp dashboard/manifest.json ~/.hermes/plugins/calendar/dashboard/manifest.json
 cp dashboard/plugin_api.py ~/.hermes/plugins/calendar/dashboard/plugin_api.py
 ```
 
-**3. Enable the backend** (the UI plugin loads automatically):
+**3. Agent skill** (so agents can discover and use the calendar):
+
+```bash
+mkdir -p ~/.hermes/skills/productivity/hermes-calendar/scripts
+cp skill/SKILL.md ~/.hermes/skills/productivity/hermes-calendar/SKILL.md
+cp skill/scripts/calendar.py ~/.hermes/skills/productivity/hermes-calendar/scripts/calendar.py
+```
+
+**4. Enable the backend** (the UI plugin loads automatically):
 
 ```bash
 hermes plugins enable calendar
@@ -151,9 +159,41 @@ its previous event has ended. An event with no end time occupies one hour.
 
 ### Agent API
 
-Hermes agents can read/write events and todos via the REST API at `/api/plugins/calendar/`. The plugin uses this internally via `ctx.rest`.
+Agents discover the calendar through a **skill** installed to
+`~/.hermes/skills/productivity/hermes-calendar/`. Hermes puts every skill's
+name and description into the system prompt, so an agent asked about the
+user's schedule finds it without being told the plugin exists.
 
-#### Events
+The skill drives `dashboard/plugin_api.py` directly — same pydantic
+validation, same SQL, same migration — through a small CLI:
+
+```bash
+CAL="python ${HERMES_HOME:-$HOME/.hermes}/skills/productivity/hermes-calendar/scripts/calendar.py"
+
+$CAL today                                       # today's events + to-dos
+$CAL list --start 2026-08-01 --end 2026-08-31    # a date range
+$CAL add --title "Dentist" --date 2026-08-12 --start-time 14:30 --end-time 15:15
+$CAL update <id> --all-day --clear-times
+$CAL delete <id>
+$CAL todo add --title "Book flights" --date 2026-08-12
+$CAL todo done <id>
+```
+
+Every command prints JSON; failures print `{"error": "..."}` and exit 1.
+Writes record `creator: "agent"` by default — pass `--agent <name>` (or set
+`HERMES_AGENT_NAME`) so the event card names which agent made it. This works
+with the desktop app closed.
+
+> **Why not HTTP?** The REST routes below are real and the plugin UI uses them
+> via `ctx.rest`, but they are not reachable from an agent's shell: every
+> `/api/` route requires the dashboard session token, and Hermes deliberately
+> strips that token from agent subprocesses because it authenticates the whole
+> dashboard — config, MCP, the agent API — not just this calendar. Importing
+> the handlers keeps identical behaviour without that credential.
+
+#### REST endpoints
+
+These serve the plugin UI. Reference for anyone extending the backend.
 
 ```bash
 # List events in a date range
@@ -169,9 +209,6 @@ POST /api/plugins/calendar/events
   "all_day": false,
   "color": "#22c55e",
   "description": "Daily sync",
-
-  // Provenance — shown on the event card. Agents should identify
-  // themselves; omitting these records the event as user-created.
   "creator": "agent",
   "creator_name": "hermes-scheduler"
 }
@@ -180,43 +217,24 @@ POST /api/plugins/calendar/events
 PUT /api/plugins/calendar/events/{id}
 { "title": "Updated title" }
 
-# Delete an event
 DELETE /api/plugins/calendar/events/{id}
+
+GET    /api/plugins/calendar/todos?date=2026-08-05
+POST   /api/plugins/calendar/todos      { "title": "Buy groceries", "date": "2026-08-05" }
+PUT    /api/plugins/calendar/todos/{id} { "completed": true }
+DELETE /api/plugins/calendar/todos/{id}
+
+GET    /api/plugins/calendar/today      # { date, events[], todos[] }
 ```
 
 `creator` is `"user"` or `"agent"` and is set **once, at creation** — a `PUT`
 cannot relabel who made an event. Pass `editor` / `editor_name` on a `PUT` to
 record who made *that* edit; the card shows it as "Last edited". A name is
 stored only alongside `"agent"`, so a `"user"` write can't carry an agent
-byline. Rows created before these fields existed report as `user`, which is the
-right assumption for a hand-made calendar.
+byline. Rows created before these fields existed report as `user`.
 
-#### Todos
-
-```bash
-# List todos for a date
-GET /api/plugins/calendar/todos?date=2026-08-05
-
-# Create a todo  (creator/creator_name accepted, same as events)
-POST /api/plugins/calendar/todos
-{ "title": "Buy groceries", "date": "2026-08-05" }
-
-# Toggle completion
-PUT /api/plugins/calendar/todos/{id}
-{ "completed": true }
-
-# Delete
-DELETE /api/plugins/calendar/todos/{id}
-```
-
-#### Today summary
-
-```bash
-GET /api/plugins/calendar/today
-# Returns { date, events[], todos[] } for today
-```
-
-Agents call these via `ctx.rest('/events?start_date=...')` inside their plugin context, or via `fetchJSON('/api/plugins/calendar/events?...')` in browser contexts.
+Dates are `YYYY-MM-DD` and times `HH:MM` (24-hour), both range-validated —
+`2026-13-01` and `25:00` are rejected.
 
 ---
 
@@ -244,9 +262,19 @@ Agents call these via `ctx.rest('/events?start_date=...')` inside their plugin c
 │  │  ├── PUT/DELETE /todos/{id}    │   │
 │  │  └── GET /today                │   │
 │  │  Data: ~/.hermes/calendar.db    │   │
-│  └──────────────────────────────────┘   │
-└─────────────────────────────────────────┘
+│  └──────────────▲───────────────────┘   │
+└─────────────────┼───────────────────────┘
+                  │ imported directly (no HTTP)
+   ┌──────────────┴───────────────────┐
+   │  skills/…/hermes-calendar        │
+   │  ├── SKILL.md  → agent discovery │
+   │  └── scripts/calendar.py → CLI   │
+   └──────────────────────────────────┘
 ```
+
+The backend is the single source of truth. The plugin UI reaches it over HTTP
+through `ctx.rest`; agents import it. Neither path duplicates the schema or the
+validation.
 
 ### Files
 
@@ -255,11 +283,17 @@ Agents call these via `ctx.rest('/events?start_date=...')` inside their plugin c
 ├── desktop-plugins/
 │   └── calendar/
 │       └── plugin.js          # Desktop UI — loaded by Hermes desktop app
-└── plugins/
-    └── calendar/
-        └── dashboard/
-            ├── manifest.json  # Plugin manifest (hidden tab, API declaration)
-            └── plugin_api.py  # FastAPI router — events + todos CRUD
+├── plugins/
+│   └── calendar/
+│       └── dashboard/
+│           ├── manifest.json  # Plugin manifest (hidden tab, API declaration)
+│           └── plugin_api.py  # FastAPI router — events + todos CRUD
+└── skills/
+    └── productivity/
+        └── hermes-calendar/
+            ├── SKILL.md       # How agents discover + use the calendar
+            └── scripts/
+                └── calendar.py  # Agent CLI — imports plugin_api.py directly
 ```
 
 ---
