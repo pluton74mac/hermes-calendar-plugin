@@ -1,0 +1,326 @@
+"""Calendar dashboard plugin — backend API routes.
+
+Mounted at /api/plugins/calendar/ by the dashboard plugin system.
+Stores events and todos in an SQLite database at ~/.hermes/calendar.db.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import sqlite3
+import time
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Any, Optional
+
+from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field
+
+log = logging.getLogger(__name__)
+
+router = APIRouter()
+
+DB_PATH = Path.home() / ".hermes" / "calendar.db"
+
+
+# ---------------------------------------------------------------------------
+# DB helpers
+# ---------------------------------------------------------------------------
+
+def _get_conn() -> sqlite3.Connection:
+    """Get a connection, creating schema on first use (idempotent)."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    _init_schema(conn)
+    return conn
+
+
+def _init_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS events (
+            id          TEXT PRIMARY KEY,
+            title       TEXT NOT NULL,
+            date        TEXT NOT NULL,
+            start_time  TEXT,
+            end_time    TEXT,
+            all_day     INTEGER NOT NULL DEFAULT 0,
+            color       TEXT DEFAULT '#4f8cff',
+            description TEXT DEFAULT '',
+            created_at  REAL NOT NULL,
+            updated_at  REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS todos (
+            id          TEXT PRIMARY KEY,
+            title       TEXT NOT NULL,
+            date        TEXT NOT NULL,
+            completed   INTEGER NOT NULL DEFAULT 0,
+            "order"     REAL NOT NULL DEFAULT 0,
+            created_at  REAL NOT NULL,
+            updated_at  REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_date ON events(date);
+        CREATE INDEX IF NOT EXISTS idx_todos_date ON todos(date);
+    """)
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _today_str() -> str:
+    return date.today().isoformat()
+
+
+def _make_id() -> str:
+    import uuid
+    return uuid.uuid4().hex[:12]
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+
+class EventCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=500)
+    date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    start_time: Optional[str] = Field(None, pattern=r"^\d{2}:\d{2}$")
+    end_time: Optional[str] = Field(None, pattern=r"^\d{2}:\d{2}$")
+    all_day: bool = False
+    color: str = "#4f8cff"
+    description: str = ""
+
+
+class EventUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=500)
+    date: Optional[str] = Field(None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    start_time: Optional[str] = Field(None, pattern=r"^\d{2}:\d{2}$")
+    end_time: Optional[str] = Field(None, pattern=r"^\d{2}:\d{2}$")
+    all_day: Optional[bool] = None
+    color: Optional[str] = None
+    description: Optional[str] = None
+
+
+class TodoCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=500)
+    date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+
+class TodoUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=500)
+    completed: Optional[bool] = None
+    order: Optional[float] = None
+    date: Optional[str] = Field(None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+
+# ---------------------------------------------------------------------------
+# Events endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/events")
+def list_events(
+    start_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    end_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+):
+    """Get events in a date range."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM events WHERE date >= ? AND date <= ? ORDER BY date, start_time",
+            (start_date, end_date),
+        ).fetchall()
+        return {"events": [dict(r) for r in rows]}
+    finally:
+        conn.close()
+
+
+@router.post("/events")
+def create_event(body: EventCreate):
+    """Create a new event."""
+    conn = _get_conn()
+    try:
+        ev_id = _make_id()
+        ts = _now()
+        conn.execute(
+            "INSERT INTO events (id, title, date, start_time, end_time, all_day, color, description, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ev_id, body.title, body.date, body.start_time, body.end_time,
+             int(body.all_day), body.color, body.description, ts, ts),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM events WHERE id = ?", (ev_id,)).fetchone()
+        return {"event": dict(row)}
+    finally:
+        conn.close()
+
+
+@router.put("/events/{event_id}")
+def update_event(event_id: str, body: EventUpdate):
+    """Update an event."""
+    conn = _get_conn()
+    try:
+        existing = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Event not found")
+
+        updates = {}
+        if body.title is not None:
+            updates["title"] = body.title
+        if body.date is not None:
+            updates["date"] = body.date
+        if body.start_time is not None:
+            updates["start_time"] = body.start_time
+        if body.end_time is not None:
+            updates["end_time"] = body.end_time
+        if body.all_day is not None:
+            updates["all_day"] = int(body.all_day)
+        if body.color is not None:
+            updates["color"] = body.color
+        if body.description is not None:
+            updates["description"] = body.description
+
+        updates["updated_at"] = _now()
+
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [event_id]
+        conn.execute(f"UPDATE events SET {set_clause} WHERE id = ?", values)
+        conn.commit()
+        row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+        return {"event": dict(row)}
+    finally:
+        conn.close()
+
+
+@router.delete("/events/{event_id}")
+def delete_event(event_id: str):
+    """Delete an event."""
+    conn = _get_conn()
+    try:
+        existing = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Event not found")
+        conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
+        conn.commit()
+        return {"deleted": True}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Todos endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/todos")
+def list_todos(
+    date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+):
+    """Get todos for a specific date."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM todos WHERE date = ? ORDER BY \"order\", created_at",
+            (date,),
+        ).fetchall()
+        return {"todos": [dict(r) for r in rows]}
+    finally:
+        conn.close()
+
+
+@router.post("/todos")
+def create_todo(body: TodoCreate):
+    """Create a new todo."""
+    conn = _get_conn()
+    try:
+        todo_id = _make_id()
+        ts = _now()
+        # Get next order value
+        max_order = conn.execute(
+            "SELECT COALESCE(MAX(\"order\"), -1) + 1 FROM todos WHERE date = ?",
+            (body.date,),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO todos (id, title, date, completed, \"order\", created_at, updated_at) "
+            "VALUES (?, ?, ?, 0, ?, ?, ?)",
+            (todo_id, body.title, body.date, max_order, ts, ts),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM todos WHERE id = ?", (todo_id,)).fetchone()
+        return {"todo": dict(row)}
+    finally:
+        conn.close()
+
+
+@router.put("/todos/{todo_id}")
+def update_todo(todo_id: str, body: TodoUpdate):
+    """Update a todo."""
+    conn = _get_conn()
+    try:
+        existing = conn.execute("SELECT * FROM todos WHERE id = ?", (todo_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Todo not found")
+
+        updates = {}
+        if body.title is not None:
+            updates["title"] = body.title
+        if body.completed is not None:
+            updates["completed"] = int(body.completed)
+        if body.order is not None:
+            updates["order"] = body.order
+        if body.date is not None:
+            updates["date"] = body.date
+
+        updates["updated_at"] = _now()
+
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [todo_id]
+        conn.execute(f"UPDATE todos SET {set_clause} WHERE id = ?", values)
+        conn.commit()
+        row = conn.execute("SELECT * FROM todos WHERE id = ?", (todo_id,)).fetchone()
+        return {"todo": dict(row)}
+    finally:
+        conn.close()
+
+
+@router.delete("/todos/{todo_id}")
+def delete_todo(todo_id: str):
+    """Delete a todo."""
+    conn = _get_conn()
+    try:
+        existing = conn.execute("SELECT * FROM todos WHERE id = ?", (todo_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Todo not found")
+        conn.execute("DELETE FROM todos WHERE id = ?", (todo_id,))
+        conn.commit()
+        return {"deleted": True}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Today summary
+# ---------------------------------------------------------------------------
+
+@router.get("/today")
+def get_today():
+    """Get today's events and todos count."""
+    today = _today_str()
+    conn = _get_conn()
+    try:
+        events = conn.execute(
+            "SELECT * FROM events WHERE date = ? ORDER BY start_time",
+            (today,),
+        ).fetchall()
+        todos = conn.execute(
+            "SELECT * FROM todos WHERE date = ? ORDER BY \"order\", created_at",
+            (today,),
+        ).fetchall()
+        return {
+            "date": today,
+            "events": [dict(r) for r in events],
+            "todos": [dict(r) for r in todos],
+        }
+    finally:
+        conn.close()

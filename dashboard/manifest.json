@@ -1,0 +1,13 @@
+{
+  "name": "calendar",
+  "label": "Calendar Backend",
+  "description": "Calendar events and todos API backend — desktop plugin only (UI loads via desktop-plugins/calendar/plugin.js, not this manifest's entry)",
+  "icon": "Calendar",
+  "version": "1.0.0",
+  "tab": {
+    "hidden": true
+  },
+  "api": "plugin_api.py",
+  "entry": null,
+  "css": null
+}
